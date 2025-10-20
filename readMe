@@ -1,0 +1,34 @@
+InternsICMarkets-Logins - $10K DEMO
+
+JOSH
+MT5 LOGIN: 52480953
+MT5 PASSWORD: gpnWB3bo$I$@&W
+MT5 SERVER: ICMarketsSC-Demo
+
+FINLEY
+MT5 LOGIN: 52480954
+MT5 PASSWORD: !8wLyfUr@rGgR7
+MT5 SERVER: ICMarketsSC-Demo
+
+TOM
+MT5 LOGIN: 52480959
+MT5 PASSWORD: I6Gf!NaW18I9mG
+MT5 SERVER: ICMarketsSC-Demo
+
+ANAMIKA
+MT5 LOGIN: 52480955
+MT5 PASSWORD: kPF9rH$&vnt1DG
+MT5 SERVER: ICMarketsSC-Demo
+
+KELAN
+MT5 LOGIN: 52480967
+MT5 PASSWORD: SfveUj@m3SsIIR
+MT5 SERVER: ICMarketsSC-Demo
+
+
+
+
+template for .bat
+@echo off
+cd /d C:\Users\anish\PycharmProjects\Educate2Trade
+start /high "" pythonw riskOn.py
