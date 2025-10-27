@@ -32,3 +32,9 @@ template for .bat
 @echo off
 cd /d C:\Users\anish\PycharmProjects\Educate2Trade
 start /high "" pythonw riskOn.py
+
+
+dependencies
+pip install MetaTrader5
+pip install pandas pytz requests
+pip install pygetwindow pywinauto

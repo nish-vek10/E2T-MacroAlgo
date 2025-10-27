@@ -5,10 +5,10 @@ from baseClass import MT5Trader, MT5ConnectionParams
 
 # --- OPTIONAL: specify a particular terminal + account to use ---
 # Leave any of these as None to use the default running MT5 session.
-MT5_PATH     = r"C:\MT5\52474875\terminal64.exe"   # e.g., r"C:\MT5\YourTerminal\terminal64.exe"
-MT5_LOGIN    = 52474875                            # e.g., 12345678  (or None)
-MT5_PASSWORD = "W7J&K6Zrsimovi"                    # e.g., "secret"  (or None)
-MT5_SERVER   = "ICMarketsSC-Demo"                  # e.g., "Broker-Demo" (or None)
+MT5_PATH     = r"C:\MT5\52474875\terminal64.exe"
+MT5_LOGIN    = 52474875
+MT5_PASSWORD = "W7J&K6Zrsimovi"
+MT5_SERVER   = "ICMarketsSC-Demo"
 
 def main():
     # Initialize via base class (uses the above credentials/path if provided)
