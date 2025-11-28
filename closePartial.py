@@ -4,9 +4,9 @@ from baseClass import MT5Trader, MT5ConnectionParams
 import MetaTrader5 as mt5
 
 # --- OPTIONAL: specify a particular terminal + account to use ---
-MT5_PATH     = r"C:\MT5\52474875\terminal64.exe"
-MT5_LOGIN    = 52474875
-MT5_PASSWORD = "W7J&K6Zrsimovi"
+MT5_PATH     = r"C:\MT5\xInterns\terminal64.exe"
+MT5_LOGIN    = 52421640
+MT5_PASSWORD = "M3Bgywv9$n8mr1"
 MT5_SERVER   = "ICMarketsSC-Demo"
 
 # Initialize trader

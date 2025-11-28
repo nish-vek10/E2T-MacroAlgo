@@ -5,9 +5,9 @@ from baseClass import MT5Trader, MT5ConnectionParams
 
 # --- OPTIONAL: specify a particular terminal + account to use ---
 # Leave any of these as None to use the default running MT5 session.
-MT5_PATH     = r"C:\MT5\52474875\terminal64.exe"
-MT5_LOGIN    = 52474875
-MT5_PASSWORD = "W7J&K6Zrsimovi"
+MT5_PATH     = r"C:\MT5\xInterns\terminal64.exe"
+MT5_LOGIN    = 52421640
+MT5_PASSWORD = "M3Bgywv9$n8mr1"
 MT5_SERVER   = "ICMarketsSC-Demo"
 
 def main():
@@ -19,7 +19,7 @@ def main():
         server=MT5_SERVER,
     )
     trader = MT5Trader(conn=conn)
-    risk_percent = 0.25
+    risk_percent = 0.01
 
     assets = [
         ("USTEC", mt5.ORDER_TYPE_SELL, 1000),

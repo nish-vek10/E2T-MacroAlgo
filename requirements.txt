@@ -1,0 +1,6 @@
+MetaTrader5
+pandas
+pytz
+requests
+pygetwindow
+pywinauto

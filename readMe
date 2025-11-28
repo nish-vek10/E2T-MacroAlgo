@@ -35,6 +35,7 @@ start /high "" pythonw riskOn.py
 
 
 dependencies
+python -m tkinter
 pip install MetaTrader5
 pip install pandas pytz requests
 pip install pygetwindow pywinauto
