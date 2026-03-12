@@ -1,328 +1,395 @@
 # baseClass.py
-# pip install MetaTrader5
-# python -m tkinter
-# pip install tkinter
-# pip install pygetwindow
-# pip install pywinauto
-
-# pip install MetaTrader5 pandas pytz requests
-# pip install pygetwindow pywinauto
-
-######   B-A-S-E  C-L-A-S-S   ######
 
 from __future__ import annotations
 
-import time
 import math
+import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Optional, Iterable, Tuple
+from typing import Optional
 
 import MetaTrader5 as mt5
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
 class MT5ConnectionParams:
     """
     Parameters to initialize a specific MT5 terminal + account.
-    - path: full path to terminal64.exe (for a specific/portable install)
-    - login/password/server: account credentials
-    All fields are optional; if omitted, MT5 will use the default running terminal/session.
+    path: full path to terminal64.exe (for a specific/portable install).
+    login/password/server: account credentials.
+    All fields are optional; MT5 uses the default running session if omitted.
     """
-    path: Optional[str] = None
-    login: Optional[int] = None
+    path:     Optional[str] = None
+    login:    Optional[int] = None
     password: Optional[str] = None
-    server: Optional[str] = None
+    server:   Optional[str] = None
 
 
 class MT5Trader:
-    MAGIC_NUMBER = 123456  # Unique identifier for this EA (Expert Advisor)
 
-    # Initialize the MT5 terminal connection (optionally with explicit terminal/account)
-    def __init__(self, conn: Optional[MT5ConnectionParams] = None, retries: int = 2, retry_sleep_s: float = 0.5):
-        self._connected = False
+    def __init__(
+        self,
+        conn:          Optional[MT5ConnectionParams] = None,
+        retries:       int   = 2,
+        retry_sleep_s: float = 0.3,
+        magic:         int   = 123456,
+        deviation:     int   = 250,
+    ):
+        self.magic_number = magic
+        self.deviation    = deviation
+        self._connected   = False
         self._connect(conn, retries=retries, retry_sleep_s=retry_sleep_s)
 
+    # ── Context manager ───────────────────────────────────────────────────────
+
+    def __enter__(self) -> MT5Trader:
+        return self
+
+    def __exit__(self, *_) -> bool:
+        self.shutdown()
+        return False  # do not suppress exceptions
+
+    # ── Connection ────────────────────────────────────────────────────────────
+
     def _connect(self, conn: Optional[MT5ConnectionParams], retries: int, retry_sleep_s: float):
-        kwargs = {}
+        kwargs: dict = {}
         if conn:
-            if conn.path:     kwargs["path"] = conn.path
-            if conn.login:    kwargs["login"] = int(conn.login)
+            if conn.path:     kwargs["path"]     = conn.path
+            if conn.login:    kwargs["login"]    = int(conn.login)
             if conn.password: kwargs["password"] = conn.password
-            if conn.server:   kwargs["server"] = conn.server
+            if conn.server:   kwargs["server"]   = conn.server
 
         for attempt in range(1, max(1, retries) + 1):
             ok = mt5.initialize(**kwargs) if kwargs else mt5.initialize()
             if ok:
                 self._connected = True
-                time.sleep(0.2)  # small sanity wait
-                _ = mt5.account_info()  # ping
+                time.sleep(0.05)      # minimal sanity wait
+                mt5.account_info()    # connection ping
                 return
-            print(f"[INIT] Attempt {attempt}/{retries} failed: {mt5.last_error()}")
+            log.warning("[INIT] Attempt %d/%d failed: %s", attempt, retries, mt5.last_error())
             time.sleep(retry_sleep_s)
 
         raise SystemExit(f"MT5 initialization failed: {mt5.last_error()}")
 
-    # Shut down the MT5 connection
     def shutdown(self):
+        """Shut down the MT5 connection."""
         if self._connected:
             mt5.shutdown()
             self._connected = False
 
-    # Get the latest tick data and symbol info
-    def get_tick_info(self, symbol):
+    # ── Tick / symbol helpers ─────────────────────────────────────────────────
+
+    def get_tick_info(self, symbol: str):
+        """Return (tick, symbol_info), or (None, None) on failure."""
         info = mt5.symbol_info(symbol)
         if info is None:
-            print(f"[ERROR] {symbol}: No symbol_info.")
+            log.error("%s: No symbol_info.", symbol)
             return None, None
         if not info.visible:
             mt5.symbol_select(symbol, True)
             info = mt5.symbol_info(symbol)
-
         tick = mt5.symbol_info_tick(symbol)
         if not tick:
-            print(f"[ERROR] No tick data for {symbol}")
+            log.error("%s: No tick data.", symbol)
             return None, None
         return tick, info
 
-    # Ensures SL is not below the broker's minimum stop level
-    def adjust_sl_to_broker_min(self, symbol_info, sl_points):
-        min_sl = getattr(symbol_info, "trade_stops_level", 0) or 0
-        if sl_points < min_sl:
-            print(f"[ERROR] {symbol_info.name}: SL too close ({sl_points}). Adjusting to min allowed: {min_sl}")
-            return int(min_sl)
-        return int(sl_points)
-
-    def _ensure_symbol_ready(self, symbol):
-        info = mt5.symbol_info(symbol)
-        if info is None:
-            print(f"[ERROR] {symbol}: No symbol_info.")
-            return None
-        if not info.visible:
-            mt5.symbol_select(symbol, True)
-        return mt5.symbol_info(symbol)  # refresh
-
-    def _wait_fresh_tick(self, symbol, timeout_ms=500):
-        """Wait for a fresh tick up to timeout_ms; return tick or None."""
-        start = time.time()
+    def _wait_fresh_tick(self, symbol: str, timeout_ms: int = 300):
+        """
+        Poll for a fresh tick up to timeout_ms milliseconds.
+        Falls back to the latest available tick on timeout.
+        Polling every 5 ms keeps latency tight for news execution.
+        """
+        start     = time.time()
         last_time = 0
         while (time.time() - start) * 1000 < timeout_ms:
             tick = mt5.symbol_info_tick(symbol)
             if tick and tick.time_msc and tick.time_msc != last_time:
                 return tick
             last_time = tick.time_msc if tick else last_time
-            time.sleep(0.01)  # 10ms
+            time.sleep(0.005)  # 5 ms
         return mt5.symbol_info_tick(symbol)
 
-    """
-            Calculate the lot size based on:
-            - Account balance
-            - Risk percentage
-            - Stop-loss size (in points)
-    """
-    def calculate_lot_size(self, symbol, sl_points, risk_percent):
+    def _get_filling_mode(self, symbol_info) -> int:
+        """
+        Auto-detect the broker's supported order filling mode for this symbol.
+        filling_mode bitmask: bit-0 = FOK, bit-1 = IOC, else Return/Book.
+        """
+        filling = getattr(symbol_info, "filling_mode", 0)
+        if filling & 1:
+            return mt5.ORDER_FILLING_FOK
+        if filling & 2:
+            return mt5.ORDER_FILLING_IOC
+        return mt5.ORDER_FILLING_RETURN
+
+    def adjust_sl_to_broker_min(self, symbol_info, sl_points: int) -> int:
+        """Clamp SL to the broker's minimum stop distance."""
+        min_sl = getattr(symbol_info, "trade_stops_level", 0) or 0
+        if sl_points < min_sl:
+            log.warning(
+                "%s: SL %d below broker minimum %d — adjusting.",
+                symbol_info.name, sl_points, min_sl,
+            )
+            return int(min_sl)
+        return int(sl_points)
+
+    def has_open_position(self, symbol: str) -> bool:
+        """Return True if this EA already has an open position on the given symbol."""
+        positions = mt5.positions_get(symbol=symbol)
+        if not positions:
+            return False
+        return any(p.magic == self.magic_number for p in positions)
+
+    # ── Lot sizing ────────────────────────────────────────────────────────────
+
+    def calculate_lot_size(self, symbol: str, sl_points: int, risk_percent: float) -> float:
+        """
+        Calculate position size from account balance, risk percentage, and SL size.
+
+        risk_percent: percentage value — e.g. 1.0 means 1% of account balance.
+        Returns 0.0 on any error or if the calculated lot falls below the broker minimum.
+        """
         account_info = mt5.account_info()
         if account_info is None:
-            print("[ERROR] Unable to retrieve account info.")
+            log.error("Unable to retrieve account info.")
             return 0.0
 
-        balance = float(account_info.balance)
-        risk_amount = (float(risk_percent) / 100.0) * balance  # Amount to risk per trade
+        balance     = float(account_info.balance)
+        risk_amount = (float(risk_percent) / 100.0) * balance
 
         tick, symbol_info = self.get_tick_info(symbol)
         if not tick or not symbol_info:
             return 0.0
 
-        # Enforce broker minimum SL
-        sl_points = self.adjust_sl_to_broker_min(symbol_info, sl_points)
-
+        sl_points     = self.adjust_sl_to_broker_min(symbol_info, sl_points)
         contract_size = getattr(symbol_info, "trade_contract_size", 0) or 0
-        tick_value = getattr(symbol_info, "trade_tick_value", 0) or 0
-        point = float(symbol_info.point or 0.0)
+        tick_value    = getattr(symbol_info, "trade_tick_value",    0) or 0
+        point         = float(symbol_info.point or 0.0)
 
         if contract_size == 0 or tick_value == 0 or point <= 0:
-            print(f"[ERROR] Invalid contract or tick value for {symbol}")
+            log.error("%s: Invalid contract or tick value.", symbol)
             return 0.0
 
         sl_price_range = float(sl_points) * point
-
         if sl_price_range <= 0:
-            print(f"[ERROR] Invalid SL or contract parameters for {symbol}")
+            log.error("%s: Invalid SL or contract parameters.", symbol)
             return 0.0
 
-        # Simplified lot size formula (approximate): lot = risk / (SL in price * value per lot)
         sl_value_per_lot = sl_price_range * (tick_value / point)
         if sl_value_per_lot == 0:
-            print(f"[ERROR] Division by zero for SL value per lot on {symbol}")
+            log.error("%s: Division by zero in SL value per lot.", symbol)
             return 0.0
 
-        # Raw lot size
-        raw_lot = risk_amount / sl_value_per_lot
-
-        # Enforce allowed lot size constraints
-        min_lot = float(symbol_info.volume_min)
-        max_lot = float(symbol_info.volume_max)
+        raw_lot  = risk_amount / sl_value_per_lot
+        min_lot  = float(symbol_info.volume_min)
+        max_lot  = float(symbol_info.volume_max)
         lot_step = float(symbol_info.volume_step)
 
         if lot_step <= 0 or min_lot <= 0 or max_lot <= 0:
-            print(f"[ERROR] {symbol}: invalid lot constraints.")
+            log.error("%s: Invalid lot constraints.", symbol)
             return 0.0
 
-        # Round down to nearest allowed step and limit to allowed range
         lot = max(min_lot, min(raw_lot, max_lot))
         lot = math.floor(lot / lot_step) * lot_step  # floor to avoid over-risk
         lot = round(lot, 3)
 
         if lot < min_lot:
-            print(f"[WARNING] {symbol}: Calculated lot {lot} is below minimum {min_lot}. Skipping trade.")
+            log.warning("%s: Calculated lot %.3f below minimum %.3f — skipping.", symbol, lot, min_lot)
             return 0.0
 
         return lot
 
-    """
-            Places a market order (BUY/SELL) with SL and comment.
-    """
-    def place_order(self, symbol, order_type, lot, sl_points, comment="AutoTrade"):
-        tick, symbol_info = self.get_tick_info(symbol)
-        if not tick or not symbol_info:
+    # ── Order execution ───────────────────────────────────────────────────────
+
+    def place_order(
+        self,
+        symbol:     str,
+        order_type: int,
+        lot:        float,
+        sl_points:  int,
+        comment:    str = "AutoTrade",
+    ) -> bool:
+        """
+        Place a market order with SL.
+        Waits for the freshest available tick before sending to maximise
+        price accuracy during fast-moving news events.
+        Returns True on a confirmed fill.
+        """
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            log.error("%s: No symbol_info.", symbol)
+            return False
+        if not symbol_info.visible:
+            mt5.symbol_select(symbol, True)
+            symbol_info = mt5.symbol_info(symbol)
+
+        tick = self._wait_fresh_tick(symbol)
+        if not tick:
+            log.error("%s: No tick data.", symbol)
             return False
 
-        price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
         point = float(symbol_info.point or 0.0)
+        price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
 
-        # Ensure SL respects the broker's minimum stop level
-        min_sl_points = getattr(symbol_info, "trade_stops_level", 0) or 0
-        if sl_points < min_sl_points:
-            print(f"[ERROR] {symbol}: SL too close ({sl_points}). Adjusting to min allowed: {min_sl_points}")
-            sl_points = int(min_sl_points)
+        # Enforce broker minimum SL
+        min_sl = getattr(symbol_info, "trade_stops_level", 0) or 0
+        if sl_points < min_sl:
+            log.warning("%s: SL %d below minimum %d — adjusting.", symbol, sl_points, min_sl)
+            sl_points = int(min_sl)
 
-        # Calculate SL price depending on order direction
-        sL = price - (sl_points * point) if order_type == mt5.ORDER_TYPE_BUY else price + (sl_points * point)
+        sl_price = (
+            price - sl_points * point if order_type == mt5.ORDER_TYPE_BUY
+            else price + sl_points * point
+        )
 
-        # Construct the trade request
         request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": float(lot),
-            "type": int(order_type),
-            "price": float(price),
-            "deviation": 250,
-            "sl": float(sL),
-            "magic": int(self.MAGIC_NUMBER),
-            "comment": str(comment),
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "action":       mt5.TRADE_ACTION_DEAL,
+            "symbol":       symbol,
+            "volume":       float(lot),
+            "type":         int(order_type),
+            "price":        float(price),
+            "deviation":    self.deviation,
+            "sl":           float(sl_price),
+            "magic":        int(self.magic_number),
+            "comment":      str(comment),
+            "type_time":    mt5.ORDER_TIME_GTC,
+            "type_filling": self._get_filling_mode(symbol_info),
         }
 
-        # Send the order
         result = mt5.order_send(request)
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            print(f"[OK] {symbol}: Trade executed successfully.")
+            log.info(
+                "[OK] %s: Filled %.3f lot @ %.5f  SL=%.5f",
+                symbol, lot, result.price, sl_price,
+            )
             return True
-        else:
-            print(f"[FAIL] {symbol}: Order failed. Retcode: {getattr(result, 'retcode', None)}")
-            print(f"→ Full result: {result}")
-            return False
 
-    """
-            Closes half of the open position.
-    """
-    def close_half_position(self, position):
-        symbol = position.symbol
-        ticket = position.ticket
+        log.error(
+            "[FAIL] %s: retcode=%s | %s",
+            symbol, getattr(result, "retcode", None), result,
+        )
+        return False
 
-        # Fetch symbol info to get lot step and min volume
-        symbol_info = mt5.symbol_info(symbol)
-        if not symbol_info:
-            print(f"[ERROR] No symbol info for {symbol}")
-            return
+    # ── Position management ───────────────────────────────────────────────────
 
-        half_volume = float(position.volume) / 2.0
-        min_lot = float(symbol_info.volume_min)
-        lot_step = float(symbol_info.volume_step)
-
-        # Round volume down to nearest lot step (avoid exceeding 50%)
-        rounded_volume = math.floor(half_volume / lot_step) * lot_step
-        rounded_volume = round(rounded_volume, 3)
-
-        # Ensure volume is valid
-        if rounded_volume < min_lot:
-            print(f"[SKIPPED] {symbol} 50% volume ({rounded_volume}) < min lot size ({min_lot})")
-            return
-
-        # Determine close direction (opposite of position type)
-        order_type = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+    def _close_single_position(self, pos) -> bool:
+        """Close one position fully. Called per-thread in close_all_positions."""
+        symbol     = pos.symbol
+        ticket     = pos.ticket
+        volume     = float(pos.volume)
+        order_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
 
         tick = mt5.symbol_info_tick(symbol)
         if not tick:
-            print(f"[ERROR] No tick data for {symbol}")
+            log.error("%s: No tick data.", symbol)
+            return False
+
+        price       = tick.bid if order_type == mt5.ORDER_TYPE_SELL else tick.ask
+        symbol_info = mt5.symbol_info(symbol)
+        filling     = self._get_filling_mode(symbol_info) if symbol_info else mt5.ORDER_FILLING_IOC
+
+        request = {
+            "action":       mt5.TRADE_ACTION_DEAL,
+            "symbol":       symbol,
+            "volume":       float(volume),
+            "type":         int(order_type),
+            "position":     int(ticket),
+            "price":        float(price),
+            "deviation":    self.deviation,
+            "magic":        int(self.magic_number),
+            "comment":      "CloseAll",
+            "type_time":    mt5.ORDER_TIME_GTC,
+            "type_filling": filling,
+        }
+
+        result = mt5.order_send(request)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            log.info("[OK] Closed %s #%d @ %.5f", symbol, ticket, price)
+            return True
+
+        log.error("[FAIL] %s #%d retcode=%s", symbol, ticket, getattr(result, "retcode", None))
+        return False
+
+    def close_all_positions(self, magic_only: bool = True) -> None:
+        """
+        Close all open positions in parallel for maximum speed.
+        magic_only=True (default): only close positions opened by this EA.
+        magic_only=False: close every open position on the account.
+        """
+        positions = mt5.positions_get()
+        if not positions:
+            log.info("No open positions.")
+            return
+
+        if magic_only:
+            positions = [p for p in positions if p.magic == self.magic_number]
+            if not positions:
+                log.info("No positions matching magic number %d.", self.magic_number)
+                return
+
+        with ThreadPoolExecutor(max_workers=len(positions)) as pool:
+            futures = {
+                pool.submit(self._close_single_position, pos): pos.symbol
+                for pos in positions
+            }
+            for fut in as_completed(futures):
+                exc = fut.exception()
+                if exc:
+                    log.error("%s: Unhandled exception during close: %s", futures[fut], exc)
+
+    def close_half_position(self, position) -> None:
+        """Close 50% of the given position."""
+        symbol      = position.symbol
+        ticket      = position.ticket
+        symbol_info = mt5.symbol_info(symbol)
+        if not symbol_info:
+            log.error("%s: No symbol info.", symbol)
+            return
+
+        half_vol = float(position.volume) / 2.0
+        min_lot  = float(symbol_info.volume_min)
+        lot_step = float(symbol_info.volume_step)
+
+        rounded_vol = math.floor(half_vol / lot_step) * lot_step
+        rounded_vol = round(rounded_vol, 3)
+
+        if rounded_vol < min_lot:
+            log.warning(
+                "%s: 50%% volume %.3f < min lot %.3f — skipping.",
+                symbol, rounded_vol, min_lot,
+            )
+            return
+
+        order_type = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            log.error("%s: No tick data.", symbol)
             return
 
         price = tick.bid if order_type == mt5.ORDER_TYPE_SELL else tick.ask
 
-        # Create request to close partial position
         request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": float(rounded_volume),
-            "type": int(order_type),
-            "position": int(ticket),
-            "price": float(price),
-            "deviation": 250,
-            "magic": int(self.MAGIC_NUMBER),
-            "comment": "PartialClose50",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "action":       mt5.TRADE_ACTION_DEAL,
+            "symbol":       symbol,
+            "volume":       float(rounded_vol),
+            "type":         int(order_type),
+            "position":     int(ticket),
+            "price":        float(price),
+            "deviation":    self.deviation,
+            "magic":        int(self.magic_number),
+            "comment":      "PartialClose50",
+            "type_time":    mt5.ORDER_TIME_GTC,
+            "type_filling": self._get_filling_mode(symbol_info),
         }
 
-        # Send request
         result = mt5.order_send(request)
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            print(f"Closed 50% of {symbol} position #{ticket}")
+            log.info("Closed 50%% of %s #%d", symbol, ticket)
         else:
-            print(f"Failed to close 50% of {symbol} position #{ticket} (retcode: {getattr(result,'retcode',None)})")
-
-    """
-            Closes all open positions in the account.
-    """
-    def close_all_positions(self):
-        positions = mt5.positions_get()
-        if not positions:
-            print("[INFO] No open positions.")
-            return
-
-        for pos in positions:
-            symbol = pos.symbol
-            ticket = pos.ticket
-            volume = float(pos.volume)
-
-            # Determine opposite order type to close position
-            order_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-
-            tick = mt5.symbol_info_tick(symbol)
-            if not tick:
-                print(f"[ERROR] No tick data for {symbol}")
-                continue
-
-            price = tick.bid if order_type == mt5.ORDER_TYPE_SELL else tick.ask
-
-            # Create close request
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": float(volume),
-                "type": int(order_type),
-                "position": int(ticket),
-                "price": float(price),
-                "deviation": 250,
-                "magic": int(self.MAGIC_NUMBER),
-                "comment": "CloseAllScript",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            }
-
-            # Send the close order
-            result = mt5.order_send(request)
-            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                print(f"[OK] Closed {symbol} position #{ticket} at price {price}")
-            else:
-                print(f"[FAIL] Could not close {symbol} position #{ticket} (retcode: {getattr(result,'retcode',None)})")
+            log.error(
+                "Failed partial close %s #%d (retcode=%s)",
+                symbol, ticket, getattr(result, "retcode", None),
+            )
